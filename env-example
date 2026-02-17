@@ -1,0 +1,25 @@
+# Пример файла окружения для проекта
+
+# Токен Telegram-бота
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+
+# API ключ для доступа к OpenAI (обязательно!)
+# Если используется ProxyAPI, укажите ключ от прокси-сервиса
+OPENAI_API_KEY=your_actual_api_key_here
+
+# Base URL для ProxyAPI (опционально)
+# Если используется ProxyAPI, укажите URL:
+# OPENAI_BASE_URL=https://api.proxyapi.ru/openai/v1
+OPENAI_BASE_URL=
+
+# Ключ доступа к Pinecone
+PINECONE_API_KEY=your_pinecone_api_key_here
+
+# Имя индекса Pinecone для памяти бота
+PINECONE_INDEX_NAME=assistant-memories-index
+
+# Модель для построения эмбеддингов
+EMBEDDING_MODEL=text-embedding-3-small
+
+# Модель чата для генерации ответов
+CHAT_MODEL=o4-mini-2025-04-16

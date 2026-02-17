@@ -1,0 +1,4 @@
+pinecone
+openai
+python-dotenv
+pyTelegramBotAPI
