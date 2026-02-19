@@ -2,3 +2,7 @@ pinecone
 openai
 python-dotenv
 pyTelegramBotAPI
+haystack-ai
+requests
+docstring-parser
+loguru
