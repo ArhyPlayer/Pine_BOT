@@ -12,6 +12,7 @@ from openai import OpenAI
 
 from config import Config
 from memory import PineconeManager, MemoryManager
+from documents import DoclingIngestionPipeline
 from handlers import BotHandlers
 
 # ------------------------------------------------------------------
@@ -57,6 +58,36 @@ def _try_build_agent(config: Config, openai_client: OpenAI):
         return None
 
 
+def _try_build_ingestion(
+    memory: MemoryManager,
+    config: Config,
+    openai_client: OpenAI,
+) -> DoclingIngestionPipeline | None:
+    """
+    Создаёт DoclingIngestionPipeline.
+
+    Не падает при отсутствии docling — бот продолжит работу без обработки файлов.
+    """
+    try:
+        import docling  # noqa: F401 — проверяем наличие пакета
+        pipeline = DoclingIngestionPipeline(
+            memory=memory,
+            config=config,
+            openai_client=openai_client,
+        )
+        logger.success("DoclingIngestionPipeline инициализирован")
+        return pipeline
+    except ImportError:
+        logger.warning(
+            "docling не установлен — обработка файлов недоступна. "
+            "Для включения выполните: pip install docling"
+        )
+        return None
+    except Exception as exc:
+        logger.warning("DoclingIngestionPipeline недоступен ({})", exc)
+        return None
+
+
 # ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
@@ -87,6 +118,7 @@ def main() -> None:
     )
 
     haystack_agent = _try_build_agent(config, openai_client)
+    ingestion_pipeline = _try_build_ingestion(memory, config, openai_client)
 
     bot = telebot.TeleBot(config.telegram_bot_token)
     BotHandlers(
@@ -95,6 +127,7 @@ def main() -> None:
         config=config,
         openai_client=openai_client,
         haystack_agent=haystack_agent,
+        ingestion_pipeline=ingestion_pipeline,
     ).register()
 
     logger.info("=" * 50)
