@@ -1,9 +1,12 @@
 """
 Обработчики команд и сообщений Telegram-бота.
 
-Регистрирует хендлеры и делегирует работу MemoryManager и HaystackAgent.
+Регистрирует хендлеры и делегирует работу MemoryManager, HaystackAgent
+и DoclingIngestionPipeline.
 """
 
+import os
+import threading
 from collections import deque
 from typing import Dict, List, Optional
 
@@ -15,9 +18,9 @@ from openai import OpenAI
 from config import Config
 from memory.manager import MemoryManager
 from agent.assistant import HaystackAgent
+from documents import DoclingIngestionPipeline, SUPPORTED_EXTENSIONS, download_telegram_file
 
 # Максимальное число сообщений (user + assistant) в краткосрочной памяти сессии.
-# 20 = 10 пар «вопрос / ответ» — достаточно для связного диалога.
 _MAX_HISTORY_MESSAGES = 20
 
 
@@ -34,14 +37,15 @@ class BotHandlers:
         config: Config,
         openai_client: OpenAI,
         haystack_agent: Optional[HaystackAgent] = None,
+        ingestion_pipeline: Optional[DoclingIngestionPipeline] = None,
     ) -> None:
         self._bot = bot
         self._memory = memory
         self._config = config
         self._client = openai_client
         self._agent = haystack_agent
-        # Краткосрочная история для каждого пользователя (текущая сессия).
-        # Не сохраняется между перезапусками бота — только в RAM.
+        self._ingestion = ingestion_pipeline
+        # Краткосрочная история для каждого пользователя (RAM, текущая сессия).
         self._histories: Dict[int, deque] = {}
 
     def register(self) -> None:
@@ -52,7 +56,15 @@ class BotHandlers:
         b.register_message_handler(self._on_memory, commands=["memory"])
         b.register_message_handler(self._on_clear, commands=["clear"])
         b.register_message_handler(self._on_forget, commands=["forget"])
-        b.register_message_handler(self._on_text, func=lambda m: True, content_types=["text"])
+        b.register_message_handler(
+            self._on_document,
+            content_types=["document"],
+        )
+        b.register_message_handler(
+            self._on_text,
+            func=lambda m: True,
+            content_types=["text"],
+        )
         b.register_callback_query_handler(
             self._on_clear_callback, func=lambda c: c.data.startswith("clear_")
         )
@@ -71,17 +83,20 @@ class BotHandlers:
             "🧠 Что я умею:\n"
             "• Запоминать информацию о тебе (предпочтения, факты, детали)\n"
             "• Использовать её в будущих разговорах\n"
-            "• Помогать с различными задачами\n\n"
+            "• Помогать с различными задачами\n"
+            "• Принимать и анализировать документы (PDF, DOCX, PPTX, HTML…)\n\n"
             "📝 Команды:\n"
             "/start — Это приветствие\n"
             "/help — Справка\n"
             "/memory — Показать что я о тебе знаю\n"
             "/clear — Очистить память\n"
             "/forget [текст] — Забыть конкретную информацию\n\n"
+            "📄 Просто пришли мне файл — я его изучу и смогу отвечать на вопросы по нему!\n\n"
             "Просто напиши мне что угодно! 😊",
         )
 
     def _on_help(self, message: types.Message) -> None:
+        ext_list = ", ".join(sorted(SUPPORTED_EXTENSIONS))
         self._bot.reply_to(
             message,
             "📚 Справка\n\n"
@@ -90,16 +105,20 @@ class BotHandlers:
             "🔹 Команды:\n"
             "/start — Приветствие\n"
             "/help — Эта справка\n"
-            "/memory — Что я знаю о тебе\n"
-            "/clear — Полностью очистить память\n"
+            "/memory — Что я знаю о тебе и какие документы загружены\n"
+            "/clear — Полностью очистить память (сообщения + документы)\n"
             "/forget [текст] — Забыть конкретную информацию\n\n"
-            "🔹 Примеры:\n"
+            "🔹 Работа с документами:\n"
+            f"Поддерживаемые форматы: {ext_list}\n"
+            "Пришли файл — я проанализирую его, сохраню в память и дам краткое резюме. "
+            "Затем можешь задавать вопросы по содержимому!\n\n"
+            "🔹 Примеры текстовых запросов:\n"
             "• «Я люблю программировать на Python»\n"
             "• «Мой любимый цвет — синий»\n"
             "• «Что ты знаешь обо мне?»\n"
             "• «Расскажи факт о собаках»\n"
             "• «Покажи картинку собаки и опиши породу»\n\n"
-            "💡 Чем больше ты рассказываешь — тем полезнее я становлюсь!",
+            "💡 Чем больше ты рассказываешь и загружаешь — тем полезнее я становлюсь!",
         )
 
     def _on_memory(self, message: types.Message) -> None:
@@ -112,22 +131,39 @@ class BotHandlers:
             if vector_count == 0:
                 self._bot.reply_to(
                     message,
-                    "🧠 Моя память о тебе пока пуста.\n\nНачни общаться — я запомню твои сообщения!",
+                    "🧠 Моя память о тебе пока пуста.\n\n"
+                    "Начни общаться или загрузи документ — я запомню!",
                 )
                 return
 
-            memories = self._memory.retrieve(
-                user_id=user_id, query="что я говорил рассказывал писал", top_k=20
-            )
-
             lines = [f"🧠 Моя память о тебе:\n\n📊 Всего записей: {vector_count}\n"]
-            if memories:
+
+            # Список загруженных документов
+            docs = self._memory.list_indexed_documents(user_id)
+            if docs:
+                lines.append("📁 Загруженные документы:\n")
+                for i, d in enumerate(docs, 1):
+                    lines.append(f"  {i}. {d['filename']} ({d['chunk_count']} фрагментов)")
+                lines.append("")
+
+            # Последние сообщения
+            memories = self._memory.retrieve(
+                user_id=user_id, query="что я говорил рассказывал писал", top_k=15
+            )
+            msg_memories = [m for m in memories if m["type"] == "message"]
+            if msg_memories:
                 lines.append("💬 Запомненные сообщения:\n")
-                lines.extend(f"{i}. {m['text'][:120]}" for i, m in enumerate(memories, 1))
-            else:
+                lines.extend(
+                    f"  {i}. {m['text'][:120]}"
+                    for i, m in enumerate(msg_memories, 1)
+                )
+
+            if not docs and not msg_memories:
                 lines.append("💬 Сообщений пока нет. Начни общаться — я запомню!")
-            lines.append("\n💡 /clear — очистить память")
+
+            lines.append("\n💡 /clear — очистить всю память")
             self._bot.reply_to(message, "\n".join(lines))
+
         except Exception as exc:
             logger.exception("Ошибка при получении статистики памяти")
             self._bot.reply_to(message, f"Произошла ошибка: {exc}")
@@ -141,7 +177,9 @@ class BotHandlers:
         )
         self._bot.reply_to(
             message,
-            "⚠️ Вы уверены, что хотите очистить всю память?\n\nЭто действие нельзя отменить!",
+            "⚠️ Вы уверены, что хотите очистить всю память?\n\n"
+            "Будут удалены все сообщения и загруженные документы.\n"
+            "Это действие нельзя отменить!",
             reply_markup=markup,
         )
 
@@ -178,25 +216,123 @@ class BotHandlers:
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
             self._bot.reply_to(
-                message, "❓ Использование: /forget [что забыть]\n\nНапример: /forget мой любимый цвет"
+                message,
+                "❓ Использование: /forget [что забыть]\n\nНапример: /forget мой любимый цвет",
             )
             return
 
         query, user_id = parts[1], message.from_user.id
         self._bot.reply_to(message, f"🔍 Ищу: «{query}»...")
 
-        memories = self._memory.retrieve(user_id, query, top_k=5, prefer_facts=True)
+        memories = self._memory.retrieve(user_id, query, top_k=5)
         if not memories:
             self._bot.reply_to(message, "🤷 Ничего похожего в памяти не найдено.")
             return
 
         lines = ["📋 Нашёл следующее:\n"]
         for i, mem in enumerate(memories, 1):
-            label = "📌 Факт" if mem["type"] == "fact" else "💬 Диалог"
+            if mem["type"] == "doc_chunk":
+                label = f"📄 {mem.get('filename', 'документ')}"
+            elif mem["type"] == "message":
+                label = "💬 Сообщение"
+            else:
+                label = "📌 Запись"
             lines.append(f"{i}. [{label}] {mem['text'][:100]}...")
             lines.append(f"   (релевантность: {mem['score']:.2f})\n")
         lines.append("⚠️ Выборочное удаление в разработке. Используй /clear для полной очистки.")
         self._bot.reply_to(message, "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Document handler
+    # ------------------------------------------------------------------
+
+    def _on_document(self, message: types.Message) -> None:
+        """Обрабатывает входящие файлы — запускает ingestion pipeline в фоне."""
+        if self._ingestion is None:
+            self._bot.reply_to(
+                message,
+                "❌ Обработка документов недоступна: docling не установлен.\n"
+                "Установите: pip install docling",
+            )
+            return
+
+        doc = message.document
+        filename = doc.file_name or f"document_{doc.file_id}"
+        ext = os.path.splitext(filename)[1].lower()
+
+        if ext not in SUPPORTED_EXTENSIONS:
+            supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            self._bot.reply_to(
+                message,
+                f"❌ Формат «{ext}» не поддерживается.\n\n"
+                f"Поддерживаемые форматы: {supported}",
+            )
+            return
+
+        self._bot.reply_to(
+            message,
+            "📄 Файл получен. Запускаю анализ и сохранение. "
+            "Это может занять немного времени…",
+        )
+
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+
+        thread = threading.Thread(
+            target=self._process_document_background,
+            args=(chat_id, user_id, doc, filename),
+            daemon=True,
+        )
+        thread.start()
+
+    def _process_document_background(
+        self,
+        chat_id: int,
+        user_id: int,
+        document,
+        filename: str,
+    ) -> None:
+        """Фоновая задача: скачать → обработать Docling → сохранить → резюме."""
+        temp_path: Optional[str] = None
+        try:
+            # 1. Скачиваем файл
+            logger.info("Скачиваем файл '{}' для user {}", filename, user_id)
+            temp_path, _ = download_telegram_file(self._bot, document)
+
+            # 2. Индексация через Docling + сохранение в Pinecone
+            chunks = self._ingestion.process(
+                file_path=temp_path,
+                filename=filename,
+                user_id=user_id,
+            )
+
+            # 3. Сообщение об успехе
+            self._bot.send_message(
+                chat_id,
+                "✅ Готово. Я изучил этот файл, теперь можем его обсудить.",
+            )
+
+            # 4. Краткое резюме (одно предложение)
+            if chunks:
+                summary = self._ingestion.summarize(chunks, filename)
+                self._bot.send_message(chat_id, f"📋 {summary}")
+
+        except ImportError as exc:
+            logger.error("docling не установлен: {}", exc)
+            self._bot.send_message(
+                chat_id,
+                "❌ Для обработки документов установите docling:\n"
+                "pip install docling",
+            )
+        except Exception as exc:
+            logger.exception("Ошибка при обработке документа '{}'", filename)
+            self._bot.send_message(
+                chat_id,
+                f"❌ Не удалось обработать файл «{filename}»: {exc}",
+            )
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     # ------------------------------------------------------------------
     # Text messages
@@ -214,15 +350,19 @@ class BotHandlers:
                 self._histories[user_id] = deque(maxlen=_MAX_HISTORY_MESSAGES)
             history: List[Dict] = list(self._histories[user_id])
 
-            # 1. Долговременный контекст из Pinecone
+            # 1. Долговременный контекст из Pinecone (сообщения + документы)
             logger.debug("Поиск воспоминаний: «{}…»", user_message[:50])
             memories = self._memory.retrieve(user_id, user_message, top_k=10)
             if memories:
-                logger.debug("Найдено {} воспоминаний:", len(memories))
+                logger.debug("Найдено {} записей:", len(memories))
                 for i, m in enumerate(memories[:3], 1):
-                    logger.debug("  {}. [{}] {}… (score: {:.3f})", i, m["type"], m["text"][:80], m["score"])
+                    src = f" [{m['filename']}]" if m.get("filename") else ""
+                    logger.debug(
+                        "  {}. [{}]{} {}… (score: {:.3f})",
+                        i, m["type"], src, m["text"][:70], m["score"],
+                    )
             else:
-                logger.debug("Долговременных воспоминаний не найдено")
+                logger.debug("Долговременных записей не найдено")
 
             context = self._memory.format_for_context(memories)
 
