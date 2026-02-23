@@ -39,6 +39,9 @@ class Config:
         self.chat_model: str = os.getenv("CHAT_MODEL", "o4-mini-2025-04-16")
         self.embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
         self.pinecone_index_name: str = os.getenv("PINECONE_INDEX_NAME", "")
+        # Username бота без символа @.
+        # Если не задан в .env — будет заполнен автоматически при старте бота.
+        self.bot_username: str = os.getenv("BOT_USERNAME", "")
 
         self._validate()
 

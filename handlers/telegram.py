@@ -62,7 +62,7 @@ class BotHandlers:
         )
         b.register_message_handler(
             self._on_text,
-            func=lambda m: True,
+            func=lambda m: m.chat.type == "private",
             content_types=["text"],
         )
         b.register_callback_query_handler(

@@ -137,7 +137,8 @@ class PineconeManager:
     ) -> None:
         try:
             embedding = self.get_embedding(text)
-            meta = dict(metadata or {})
+            # Pinecone отклоняет None-значения в метаданных — убираем их заранее
+            meta = {k: v for k, v in (metadata or {}).items() if v is not None}
             meta["text"] = text
             self.index.upsert(vectors=[(doc_id, embedding, meta)], namespace=namespace)
             logger.debug("Документ '{}' записан", doc_id)

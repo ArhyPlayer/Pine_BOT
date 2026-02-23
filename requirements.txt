@@ -3,6 +3,7 @@ openai
 python-dotenv
 pyTelegramBotAPI
 haystack-ai
+pinecone-haystack
 requests
 docstring-parser
 loguru
